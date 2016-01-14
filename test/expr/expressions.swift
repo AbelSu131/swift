@@ -128,7 +128,7 @@ func errorRecovery() {
   var f: (Int,Int) = (1, 2, f : 3) // expected-error {{cannot convert value of type '(Int, Int, f: Int)' to specified type '(Int, Int)'}}
   
   // <rdar://problem/22426860> CrashTracer: [USER] swift at …mous_namespace::ConstraintGenerator::getTypeForPattern + 698
-  var (g1, g2, g3) = (1, 2) // expected-error {{different number of elements}}
+  var (g1, g2, g3) = (1, 2) // expected-error {{'(Int, Int)' is not convertible to '(_, _, _)', tuples have a different number of elements}}
 }
 
 func acceptsInt(x: Int) {}
@@ -405,13 +405,13 @@ var st_u11 = " \u{00110000} "  // expected-error {{invalid unicode scalar}}
 func stringliterals(d: [String: Int]) {
 
   // rdar://11385385
-  var x = 4
+  let x = 4
   "Hello \(x+1) world"
   
   "Error: \(x+1"; // expected-error {{unterminated string literal}}
   
   "Error: \(x+1   // expected-error {{unterminated string literal}}
-  ;
+  ;    // expected-error {{';' statements are not allowed}}
 
   // rdar://14050788 [DF] String Interpolations can't contain quotes
   "test \("nested")"
@@ -432,6 +432,7 @@ func stringliterals(d: [String: Int]) {
   // expected-error @-2 {{unterminated string literal}} expected-error @-1 {{unterminated string literal}}
 
   // FIXME: bad diagnostics.
+  // expected-warning @+1 {{initialization of variable 'x2' was never used; consider replacing with assignment to '_' or removing it}}
   /* expected-error {{unterminated string literal}} expected-error {{expected ',' separator}} expected-error {{expected ',' separator}} expected-note {{to match this opening '('}}  */ var x2 : () = ("hello" + "
   ; // expected-error {{expected expression in list of expressions}}
 } // expected-error {{expected ')' in expression list}}
@@ -448,13 +449,11 @@ func testSingleQuoteStringLiterals() {
   'abc" // expected-error{{unterminated string literal}}
   "a'c"
 
-  // FIXME: <rdar://problem/22709931> QoI: Single-quote => double-quote string literal fixit should escape quote chars
-  // FIXME: The suggested replacement should un-escape the single quote
-  // character.
-  'ab\'c' // expected-error{{single-quoted string literal found, use '"'}}{{3-10="ab\\'c"}}
+  'ab\'c' // expected-error{{single-quoted string literal found, use '"'}}{{3-10="ab'c"}}
 
-  // FIXME: The suggested replacement should escape the double-quote character.
-  'ab"c' // expected-error{{single-quoted string literal found, use '"'}}{{3-9="ab"c"}}
+  'ab"c' // expected-error{{single-quoted string literal found, use '"'}}{{3-9="ab\\"c"}}
+  'ab\"c' // expected-error{{single-quoted string literal found, use '"'}}{{3-10="ab\\"c"}}
+  'ab\\"c' // expected-error{{single-quoted string literal found, use '"'}}{{3-11="ab\\\\\\"c"}}
 }
 
 // <rdar://problem/17128913>
@@ -534,7 +533,7 @@ struct Rule {
 }
 
 var ruleVar: Rule
-ruleVar = Rule("a") // expected-error {{cannot convert value of type 'String' to expected argument type '(target: String, dependencies: String)'}}
+ruleVar = Rule("a") // expected-error {{missing argument for parameter 'dependencies' in call}}
 
 
 class C {
@@ -544,7 +543,8 @@ class C {
   func method() {}
 }
 
-var c = C(3) // expected-error {{cannot convert value of type 'Int' to expected argument type 'C?'}}
+_ = C(3) // expected-error {{missing argument label 'other:' in call}}
+_ = C(other: 3) // expected-error {{cannot convert value of type 'Int' to expected argument type 'C?'}}
 
 //===----------------------------------------------------------------------===//
 // Unary Operators
@@ -552,17 +552,17 @@ var c = C(3) // expected-error {{cannot convert value of type 'Int' to expected 
 
 func unaryOps(inout i8: Int8, inout i64: Int64) {
   i8 = ~i8
-  ++i64
-  --i8
+  i64 += 1
+  i8 -= 1
 
-  ++Int64(5) // expected-error{{cannot pass immutable value to mutating operator: function call returns immutable value}}
+  Int64(5) += 1 // expected-error{{left side of mutating operator isn't mutable: function call returns immutable value}}
   
   // <rdar://problem/17691565> attempt to modify a 'let' variable with ++ results in typecheck error not being able to apply ++ to Float
   let a = i8 // expected-note {{change 'let' to 'var' to make it mutable}} {{3-6=var}}
-  ++a // expected-error {{cannot pass immutable value to mutating operator: 'a' is a 'let' constant}}
+  a += 1 // expected-error {{left side of mutating operator isn't mutable: 'a' is a 'let' constant}}
   
   var b : Int { get { }}
-  ++b  // expected-error {{cannot pass immutable value to mutating operator: 'b' is a get-only property}}
+  b += 1  // expected-error {{left side of mutating operator isn't mutable: 'b' is a get-only property}}
 }
 
 //===----------------------------------------------------------------------===//
@@ -598,7 +598,7 @@ func +-+= (inout x: Int, y: Int) -> Int { return 0}
 
 func lvalue_processing() {
   var i = 0
-  ++i   // obviously ok
+  i += 1   // obviously ok
 
   var fn = (+-+=)
 
@@ -779,11 +779,11 @@ func r22211854() {
     func f(x: Int, _ y: Int, _ z: String = "") {}
     func g<T>(x: T, _ y: T, _ z: String = "") {}
 
-    f(1) // expected-error{{cannot invoke 'f' with an argument list of type '(Int)'}} expected-note{{expected an argument list of type '(Int, Int, String)'}}
-    g(1) // expected-error{{cannot invoke 'g' with an argument list of type '(Int)'}} expected-note{{expected an argument list of type '(T, T, String)'}}
+    f(1) // expected-error{{missing argument for parameter #2 in call}}
+    g(1) // expected-error{{missing argument for parameter #2 in call}}
     func h() -> Int { return 1 }
-    f(h() == 1) // expected-error{{cannot invoke 'f' with an argument list of type '(Bool)'}} expected-note{{expected an argument list of type '(Int, Int, String)'}}
-    g(h() == 1) // expected-error{{cannot invoke 'g' with an argument list of type '(Bool)'}} expected-note{{expected an argument list of type '(T, T, String)'}}
+    f(h() == 1) // expected-error{{missing argument for parameter #2 in call}}
+    g(h() == 1) // expected-error{{missing argument for parameter #2 in call}}
 }
 
 // <rdar://problem/22348394> Compiler crash on invoking function with labeled defaulted param with non-labeled argument
@@ -797,3 +797,35 @@ protocol P { var y: String? { get } }
 func r23185177(x: P?) -> [String] {
   return x?.y // expected-error{{cannot convert return expression of type 'String?' to return type '[String]'}}
 }
+
+// <rdar://problem/22913570> Miscompile: wrong argument parsing when calling a function in swift2.0
+func r22913570() {
+  func f(from: Int = 0, to: Int) {}
+  f(1 + 1) // expected-error{{missing argument for parameter 'to' in call}}
+}
+
+
+// <rdar://problem/23708702> Emit deprecation warnings for ++/-- in Swift 2.2
+func swift22_deprecation_increment_decrement() {
+  var i = 0
+  var f = 1.0
+  var si = "foo".startIndex
+
+  i++     // expected-warning {{'++' is deprecated: it will be removed in Swift 3}} {{4-6= += 1}}
+  --i     // expected-warning {{'--' is deprecated: it will be removed in Swift 3}} {{3-5=}} {{6-6= -= 1}}
+  _ = i++ // expected-warning {{'++' is deprecated: it will be removed in Swift 3}}
+
+  ++f     // expected-warning {{'++' is deprecated: it will be removed in Swift 3}} {{3-5=}} {{6-6= += 1}}
+  f--     // expected-warning {{'--' is deprecated: it will be removed in Swift 3}} {{4-6= -= 1}}
+  _ = f-- // expected-warning {{'--' is deprecated: it will be removed in Swift 3}}
+
+
+  ++si      // expected-warning {{'++' is deprecated: it will be removed in Swift 3}} {{3-5=}} {{7-7= = si.successor()}}
+  --si      // expected-warning {{'--' is deprecated: it will be removed in Swift 3}} {{3-5=}} {{7-7= = si.predecessor()}}
+  si++      // expected-warning {{'++' is deprecated: it will be removed in Swift 3}} {{5-7= = si.successor()}}
+  si--      // expected-warning {{'--' is deprecated: it will be removed in Swift 3}} {{5-7= = si.predecessor()}}
+  _ = --si  // expected-warning {{'--' is deprecated: it will be removed in Swift 3}}
+}
+
+
+

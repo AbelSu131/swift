@@ -1,8 +1,8 @@
-//===--- IRGenDebugInfo.h - Debug Info Support-----------------------------===//
+//===--- IRGenDebugInfo.cpp - Debug Info Support --------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See http://swift.org/LICENSE.txt for license information
@@ -553,15 +553,21 @@ llvm::DIScope *IRGenDebugInfo::getOrCreateContext(DeclContext *DC) {
   if (!DC)
     return TheCU;
 
+  if (isa<FuncDecl>(DC))
+    if (auto *Decl = IGM.SILMod->lookUpFunction(
+          SILDeclRef(cast<AbstractFunctionDecl>(DC), SILDeclRef::Kind::Func)))
+      return getOrCreateScope(Decl->getDebugScope());
+
   switch (DC->getContextKind()) {
-  // TODO: Create a cache for functions.
-  case DeclContextKind::AbstractClosureExpr:
+  // The interesting cases are already handled above.
   case DeclContextKind::AbstractFunctionDecl:
+  case DeclContextKind::AbstractClosureExpr:
 
   // We don't model these in DWARF.
   case DeclContextKind::SerializedLocal:
   case DeclContextKind::Initializer:
   case DeclContextKind::ExtensionDecl:
+  case DeclContextKind::SubscriptDecl:
     return getOrCreateContext(DC->getParent());
 
   case DeclContextKind::TopLevelCodeDecl:
@@ -644,7 +650,6 @@ static bool isAllocatingConstructor(SILFunctionTypeRepresentation Rep,
 llvm::DISubprogram *IRGenDebugInfo::emitFunction(
     SILModule &SILMod, const SILDebugScope *DS, llvm::Function *Fn,
     SILFunctionTypeRepresentation Rep, SILType SILTy, DeclContext *DeclCtx) {
-  // Returned a previously cached entry for an abstract (inlined) function.
   auto cached = ScopeCache.find(DS);
   if (cached != ScopeCache.end())
     return cast<llvm::DISubprogram>(cached->second);
@@ -677,9 +682,11 @@ llvm::DISubprogram *IRGenDebugInfo::emitFunction(
     ScopeLine = FL.LocForLinetable.Line;
   }
 
-  auto File = getOrCreateFile(L.Filename);
-  auto Scope = MainModule;
   auto Line = L.Line;
+  auto File = getOrCreateFile(L.Filename);
+  llvm::DIScope *Scope = MainModule;
+  if (DS->SILFn && DS->SILFn->getDeclContext())
+    Scope = getOrCreateContext(DS->SILFn->getDeclContext()->getParent());
 
   // We know that main always comes from MainFile.
   if (LinkageName == SWIFT_ENTRY_POINT_FUNCTION) {
@@ -857,30 +864,10 @@ void IRGenDebugInfo::emitTypeMetadata(IRGenFunction &IGF,
                       (Alignment)CI.getTargetInfo().getPointerAlign(0));
   emitVariableDeclaration(IGF.Builder, Metadata, DbgTy, IGF.getDebugScope(),
                           TName, 0,
-                          // swift.type is a already pointer type,
+                          // swift.type is already a pointer type,
                           // having a shadow copy doesn't add another
                           // layer of indirection.
                           DirectValue, ArtificialValue);
-}
-
-void IRGenDebugInfo::emitStackVariableDeclaration(
-    IRBuilder &B, ArrayRef<llvm::Value *> Storage, DebugTypeInfo DbgTy,
-    const SILDebugScope *DS, StringRef Name, IndirectionKind Indirection) {
-  emitVariableDeclaration(B, Storage, DbgTy, DS, Name, 0, Indirection,
-                          RealValue);
-}
-
-void IRGenDebugInfo::emitArgVariableDeclaration(
-    IRBuilder &Builder, ArrayRef<llvm::Value *> Storage, DebugTypeInfo DbgTy,
-    const SILDebugScope *DS, StringRef Name, unsigned ArgNo,
-    IndirectionKind Indirection, ArtificialKind IsArtificial) {
-  assert(ArgNo > 0);
-  if (Name == IGM.Context.Id_self.str())
-    emitVariableDeclaration(Builder, Storage, DbgTy, DS, Name, ArgNo,
-                            DirectValue, ArtificialValue);
-  else
-    emitVariableDeclaration(Builder, Storage, DbgTy, DS, Name, ArgNo,
-                            Indirection, IsArtificial);
 }
 
 /// Return the DIFile that is the ancestor of Scope.
@@ -890,12 +877,9 @@ llvm::DIFile *IRGenDebugInfo::getFile(llvm::DIScope *Scope) {
     case llvm::dwarf::DW_TAG_lexical_block:
       Scope = cast<llvm::DILexicalBlock>(Scope)->getScope();
       break;
-    case llvm::dwarf::DW_TAG_subprogram: {
-      // Scopes are not indexed by UID.
-      llvm::DITypeIdentifierMap EmptyMap;
-      Scope = cast<llvm::DISubprogram>(Scope)->getScope().resolve(EmptyMap);
+    case llvm::dwarf::DW_TAG_subprogram:
+      Scope = cast<llvm::DISubprogram>(Scope)->getFile();
       break;
-    }
     default:
       return MainFile;
     }
@@ -985,6 +969,10 @@ void IRGenDebugInfo::emitVariableDeclaration(
     IRBuilder &Builder, ArrayRef<llvm::Value *> Storage, DebugTypeInfo DbgTy,
     const SILDebugScope *DS, StringRef Name, unsigned ArgNo,
     IndirectionKind Indirection, ArtificialKind Artificial) {
+  // Self is always an artificial argument.
+  if (ArgNo > 0 && Name == IGM.Context.Id_self.str())
+    Artificial = ArtificialValue;
+
   // FIXME: Make this an assertion.
   // assert(DS && "variable has no scope");
   if (!DS)
@@ -1018,14 +1006,7 @@ void IRGenDebugInfo::emitVariableDeclaration(
 
   // Create the descriptor for the variable.
   llvm::DILocalVariable *Var = nullptr;
-  llvm::DIExpression *Expr = DBuilder.createExpression();
 
-  if (Indirection) {
-    // Classes are always passed by reference.
-    int64_t Addr[] = { llvm::dwarf::DW_OP_deref };
-    Expr = DBuilder.createExpression(Addr);
-    // FIXME: assert(Flags == 0 && "Complex variables cannot have flags");
-  }
   /// This could be Opts.Optimize if we would also unique DIVariables here.
   bool Optimized = false;
   Var = (ArgNo > 0)
@@ -1043,6 +1024,10 @@ void IRGenDebugInfo::emitVariableDeclaration(
   ElementSizes EltSizes(DITy, DIRefMap, IndirectEnumCases);
   auto Dim = EltSizes.getNext();
   for (llvm::Value *Piece : Storage) {
+    SmallVector<uint64_t, 3> Operands;
+    if (Indirection)
+      Operands.push_back(llvm::dwarf::DW_OP_deref);
+
     // There are variables without storage, such as "struct { func foo() {} }".
     // Emit them as constant 0.
     if (isa<llvm::UndefValue>(Piece))
@@ -1057,7 +1042,7 @@ void IRGenDebugInfo::emitVariableDeclaration(
       if (!Dim.SizeInBits || (StorageSize && Dim.SizeInBits > StorageSize))
         Dim.SizeInBits = StorageSize;
 
-      // FIXME: Occasionally we miss out that the Storage is acually a
+      // FIXME: Occasionally we miss out that the Storage is actually a
       // refcount wrapper. Silently skip these for now.
       if (OffsetInBits+Dim.SizeInBits > VarSizeInBits)
         break;
@@ -1069,13 +1054,9 @@ void IRGenDebugInfo::emitVariableDeclaration(
       assert(Dim.SizeInBits < VarSizeInBits
              && "piece covers entire var");
       assert(OffsetInBits+Dim.SizeInBits <= VarSizeInBits && "pars > totum");
-      SmallVector<uint64_t, 3> Elts;
-      if (Indirection)
-        Elts.push_back(llvm::dwarf::DW_OP_deref);
-      Elts.push_back(llvm::dwarf::DW_OP_bit_piece);
-      Elts.push_back(OffsetInBits);
-      Elts.push_back(Dim.SizeInBits);
-      Expr = DBuilder.createExpression(Elts);
+      Operands.push_back(llvm::dwarf::DW_OP_bit_piece);
+      Operands.push_back(OffsetInBits);
+      Operands.push_back(Dim.SizeInBits);
 
       auto Size = Dim.SizeInBits;
       Dim = EltSizes.getNext();
@@ -1083,13 +1064,15 @@ void IRGenDebugInfo::emitVariableDeclaration(
         llvm::RoundUpToAlignment(Size, Dim.AlignInBits ? Dim.AlignInBits
                                                        : SizeOfByte);
     }
-    emitDbgIntrinsic(BB, Piece, Var, Expr, Line, Loc.Col, Scope, DS);
+    emitDbgIntrinsic(BB, Piece, Var, DBuilder.createExpression(Operands), Line,
+                     Loc.Col, Scope, DS);
   }
 
   // Emit locationless intrinsic for variables that were optimized away.
   if (Storage.size() == 0) {
     auto *undef = llvm::UndefValue::get(DbgTy.StorageType);
-    emitDbgIntrinsic(BB, undef, Var, Expr, Line, Loc.Col, Scope, DS);
+    emitDbgIntrinsic(BB, undef, Var, DBuilder.createExpression(), Line, Loc.Col,
+                     Scope, DS);
   }
 }
 
@@ -1112,7 +1095,7 @@ void IRGenDebugInfo::emitDbgIntrinsic(llvm::BasicBlock *BB,
 
   // A dbg.declare is only meaningful if there is a single alloca for
   // the variable that is live throughout the function. With SIL
-  // optimizations this is not guranteed and a variable can end up in
+  // optimizations this is not guaranteed and a variable can end up in
   // two allocas (for example, one function inlined twice).
   if (!Opts.Optimize &&
       (isa<llvm::AllocaInst>(Storage) ||
@@ -1154,14 +1137,9 @@ StringRef IRGenDebugInfo::getMangledName(DebugTypeInfo DbgTy) {
   if (MetadataTypeDecl && DbgTy.getDecl() == MetadataTypeDecl)
     return BumpAllocatedString(DbgTy.getDecl()->getName().str());
 
-  llvm::SmallString<160> Buffer;
-  {
-    llvm::raw_svector_ostream S(Buffer);
-    Mangle::Mangler M(S, /* DWARF */ true);
-    M.mangleTypeForDebugger(DbgTy.getType(), DbgTy.getDeclContext());
-  }
-  assert(!Buffer.empty() && "mangled name came back empty");
-  return BumpAllocatedString(Buffer);
+  Mangle::Mangler M(/* DWARF */ true);
+  M.mangleTypeForDebugger(DbgTy.getType(), DbgTy.getDeclContext());
+  return BumpAllocatedString(M.finalize());
 }
 
 /// Create a member of a struct, class, tuple, or enum.
@@ -1826,7 +1804,7 @@ static bool canMangle(TypeBase *Ty) {
   switch (Ty->getKind()) {
   case TypeKind::PolymorphicFunction: // Mangler crashes.
   case TypeKind::GenericFunction:     // Not yet supported.
-  case TypeKind::SILBlockStorage:     // Not suported at all.
+  case TypeKind::SILBlockStorage:     // Not supported at all.
   case TypeKind::SILBox:
     return false;
   case TypeKind::InOut: {

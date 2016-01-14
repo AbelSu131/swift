@@ -1,8 +1,8 @@
-//===-- CompilerInvocation.cpp - CompilerInvocation methods ---------------===//
+//===--- CompilerInvocation.cpp - CompilerInvocation methods --------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2016 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See http://swift.org/LICENSE.txt for license information
@@ -22,6 +22,7 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/LineIterator.h"
 #include "llvm/Support/Path.h"
 
 using namespace swift;
@@ -90,6 +91,34 @@ static void debugFailWithCrash() {
   LLVM_BUILTIN_TRAP;
 }
 
+static unsigned readFileList(std::vector<std::string> &inputFiles,
+                             const llvm::opt::Arg *filelistPath,
+                             const llvm::opt::Arg *primaryFileArg = nullptr) {
+  bool foundPrimaryFile = false;
+  unsigned primaryFileIndex = 0;
+  StringRef primaryFile;
+  if (primaryFileArg)
+    primaryFile = primaryFileArg->getValue();
+
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(filelistPath->getValue());
+  assert(buffer && "can't read filelist; unrecoverable");
+
+  for (StringRef line : make_range(llvm::line_iterator(*buffer.get()), {})) {
+    inputFiles.push_back(line);
+    if (foundPrimaryFile)
+      continue;
+    if (line == primaryFile)
+      foundPrimaryFile = true;
+    else
+      ++primaryFileIndex;
+  }
+
+  if (primaryFileArg)
+    assert(foundPrimaryFile && "primary file not found in filelist");
+  return primaryFileIndex;
+}
+
 static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
                               DiagnosticEngine &Diags) {
   using namespace options;
@@ -124,6 +153,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
   Opts.PrintStats |= Args.hasArg(OPT_print_stats);
   Opts.PrintClangStats |= Args.hasArg(OPT_print_clang_stats);
   Opts.DebugTimeFunctionBodies |= Args.hasArg(OPT_debug_time_function_bodies);
+  Opts.DebugTimeCompilation |= Args.hasArg(OPT_debug_time_compilation);
 
   Opts.PlaygroundTransform |= Args.hasArg(OPT_playground);
   if (Args.hasArg(OPT_disable_playground_transform))
@@ -141,16 +171,25 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
     }
   }
 
-  for (const Arg *A : make_range(Args.filtered_begin(OPT_INPUT,
-                                                     OPT_primary_file),
-                                 Args.filtered_end())) {
-    if (A->getOption().matches(OPT_INPUT)) {
-      Opts.InputFilenames.push_back(A->getValue());
-    } else if (A->getOption().matches(OPT_primary_file)) {
-      Opts.PrimaryInput = SelectedInput(Opts.InputFilenames.size());
-      Opts.InputFilenames.push_back(A->getValue());
-    } else {
-      llvm_unreachable("Unknown input-related argument!");
+  if (const Arg *A = Args.getLastArg(OPT_filelist)) {
+    const Arg *primaryFileArg = Args.getLastArg(OPT_primary_file);
+    auto primaryFileIndex = readFileList(Opts.InputFilenames, A,
+                                         primaryFileArg);
+    if (primaryFileArg)
+      Opts.PrimaryInput = SelectedInput(primaryFileIndex);
+    assert(!Args.hasArg(OPT_INPUT) && "mixing -filelist with inputs");
+  } else {
+    for (const Arg *A : make_range(Args.filtered_begin(OPT_INPUT,
+                                                       OPT_primary_file),
+                                   Args.filtered_end())) {
+      if (A->getOption().matches(OPT_INPUT)) {
+        Opts.InputFilenames.push_back(A->getValue());
+      } else if (A->getOption().matches(OPT_primary_file)) {
+        Opts.PrimaryInput = SelectedInput(Opts.InputFilenames.size());
+        Opts.InputFilenames.push_back(A->getValue());
+      } else {
+        llvm_unreachable("Unknown input-related argument!");
+      }
     }
   }
 
@@ -289,7 +328,12 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
   else
     Opts.InputKind = InputFileKind::IFK_Swift;
 
-  Opts.OutputFilenames = Args.getAllArgValues(OPT_o);
+  if (const Arg *A = Args.getLastArg(OPT_output_filelist)) {
+    readFileList(Opts.OutputFilenames, A);
+    assert(!Args.hasArg(OPT_o) && "don't use -o with -output-filelist");
+  } else {
+    Opts.OutputFilenames = Args.getAllArgValues(OPT_o);
+  }
 
   bool UserSpecifiedModuleName = false;
   {
@@ -808,12 +852,9 @@ static bool ParseClangImporterArgs(ClangImporterOptions &Opts,
     });
   }
 
-  Opts.InferImplicitProperties |=
-    Args.hasArg(OPT_enable_objc_implicit_properties);
-
   Opts.OmitNeedlessWords |= Args.hasArg(OPT_enable_omit_needless_words);
   Opts.InferDefaultArguments |= Args.hasArg(OPT_enable_infer_default_arguments);
-
+  Opts.UseSwiftLookupTables |= Args.hasArg(OPT_enable_swift_name_lookup_tables);
   Opts.DumpClangDiagnostics |= Args.hasArg(OPT_dump_clang_diagnostics);
 
   if (Args.hasArg(OPT_embed_bitcode))
@@ -1002,6 +1043,10 @@ static bool ParseSILArgs(SILOptions &Opts, ArgList &Args,
 
   Opts.GenerateProfile |= Args.hasArg(OPT_profile_generate);
   Opts.EmitProfileCoverageMapping |= Args.hasArg(OPT_profile_coverage_mapping);
+  Opts.UseNativeSuperMethod |=
+    Args.hasArg(OPT_use_native_super_method);
+  Opts.EnableGuaranteedClosureContexts |=
+    Args.hasArg(OPT_enable_guaranteed_closure_contexts);
 
   return false;
 }
@@ -1078,6 +1123,13 @@ static bool ParseIRGenArgs(IRGenOptions &Opts, ArgList &Args,
     }
 
     Opts.LinkLibraries.push_back(LinkLibrary(A->getValue(), Kind));
+  }
+
+  if (auto valueNames = Args.getLastArg(OPT_disable_llvm_value_names,
+                                        OPT_enable_llvm_value_names)) {
+    Opts.HasValueNamesSetting = true;
+    Opts.ValueNames =
+      valueNames->getOption().matches(OPT_enable_llvm_value_names);
   }
 
   Opts.DisableLLVMOptzns |= Args.hasArg(OPT_disable_llvm_optzns);
